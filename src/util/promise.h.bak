@@ -1,0 +1,944 @@
+#ifndef UTIL_PROMISE_H_
+#define UTIL_PROMISE_H_
+
+////////////////////////////////////////////////////////////////////////////////
+// Promise: inspired by Javascript Promises/A+
+//
+// Customized for Idina:
+//   * adapts to existing Class::Reset() idiom
+//   * implements maximum parallelism in PromiseForAll, with grouping to support
+//     certain AWS batching scenarios
+//   * no exceptions (i.e. Promise::reject not implemented)
+//
+// Overview of public methods and functions:
+//   Promise: builder of continuation chains that asynchronously provides values
+//     Promise::resolve
+//     Promise::deferred
+//     Promise::then
+//     Promise::get
+//     Promise::wait
+//   MakePromise:   a collection of overloads that a.) wrap values as resolved
+//                  promises or b.) wrap Idina functions and classes that take
+//                  callbacks as pending promises.
+//   PromiseForAll: given a vector of promises, or a vector of values and
+//                  mapping from those values to promises, fan-in to a single
+//                  promise of type Promise<std::vector<T>> or Promise<void>.
+//
+// See further comments for more details.
+//
+#include <assert.h>
+#include <stdlib.h>
+#include <functional>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+#include "util/arena.h"
+#include "util/semaphore.h"
+
+namespace ks {
+template <typename T> class Promise;
+namespace promise_internal {
+
+template<typename T, typename = void>
+struct resolved_value {
+  using type = std::optional<bool>;
+};
+template <typename T>
+struct resolved_value<T, std::enable_if_t<!std::is_void_v<T>>> {
+  using type = std::optional<T>;
+};
+
+template<typename T, typename = void>
+struct continuation {
+  using type = std::function<void()>;
+};
+template <typename T>
+struct continuation<T, std::enable_if_t<!std::is_void_v<T> &&
+    !std::is_copy_constructible_v<T>>> {
+  static const bool always_move = true;
+  static const bool always_copy = false;
+  using type = std::function<void(T)>;
+};
+template <typename T>
+struct continuation<T, std::enable_if_t<!std::is_void_v<T> &&
+    std::is_copy_constructible_v<T> && std::is_scalar_v<T>>> {
+  static const bool always_move = false;
+  static const bool always_copy = true;
+  using type = std::function<void(T)>;
+};
+template <typename T>
+struct continuation<T, std::enable_if_t<!std::is_void_v<T> &&
+    std::is_copy_constructible_v<T> && !std::is_scalar_v<T> &&
+    !std::is_const_v<T> && std::is_reference_v<T>>> {
+  static const bool always_move = false;
+  static const bool always_copy = false;
+  using type = std::function<void(T&)>;
+};
+template <typename T>
+struct continuation<T, std::enable_if_t<!std::is_void_v<T> &&
+    std::is_copy_constructible_v<T> && !std::is_scalar_v<T> &&
+    std::is_const_v<T> && std::is_reference_v<T>>> {
+  static const bool always_move = false;
+  static const bool always_copy = false;
+  using type = std::function<void(const T&)>;
+};
+template <typename T>
+struct continuation<T, std::enable_if_t<!std::is_void_v<T> &&
+    std::is_copy_constructible_v<T> && !std::is_scalar_v<T> &&
+    !std::is_reference_v<T>>> {
+  static const bool always_move = false;
+  static const bool always_copy = false;
+  using type = std::function<void(T&&)>;
+};
+
+template<typename F, typename T, typename = void>
+struct is_invocable : std::is_invocable<F> {};
+template<typename F, typename T>
+struct is_invocable<F, T, std::enable_if_t<!std::is_void_v<T>>> :
+    std::is_invocable<F, T&&> {};
+template <typename F, typename T>
+const bool is_invocable_v = is_invocable<F, T>::value;
+
+static inline std::false_type is_promise(...);
+template <typename U>
+static inline std::true_type is_promise(const volatile Promise<U>*);
+template <typename U>
+const bool is_promise_v = decltype(is_promise(
+    std::declval<typename std::decay<U>::type*>()))::value;
+
+template <typename U, typename = void>
+struct unwrap_promise {
+  using type = U;
+};
+template <typename U>
+struct unwrap_promise<U, std::enable_if_t<is_promise_v<U>>> {
+  using type = typename U::type;
+};
+
+template <typename T>
+struct PromiseState {
+  template <typename U = T, typename = std::enable_if_t<std::is_void_v<U>>>
+  void init_as_resolved() {
+    resolved_value = true;
+  }
+
+  template <typename V>
+  void init_as_resolved(V&& v) {
+    if constexpr (std::is_lvalue_reference_v<V>) {
+      resolved_value.template emplace<T>(T(v));
+    } else {
+      resolved_value.template emplace<T>(std::forward<V>(v));
+    }
+  }
+
+  template <typename U = T, typename = std::enable_if_t<std::is_void_v<U>>>
+  void resolve() {
+    if (!fn) mutex.lock();
+    if (fn) {
+      typename continuation<T>::type fn;
+      std::swap(this->fn, fn);
+      fn();
+    } else {
+      assert(!is_resolved());
+      resolved_value = true;
+      mutex.unlock();
+    }
+  };
+
+  template <typename V>
+  void resolve(V&& v) {
+    if (!fn) mutex.lock();
+    if (fn) {
+      typename continuation<T>::type fn;
+      std::swap(this->fn, fn);
+      if constexpr (continuation<T>::always_move) {
+        fn(std::move(v));
+      } else if constexpr (continuation<T>::always_copy ||
+                           std::is_lvalue_reference_v<V>) {
+        fn(T(v));
+      } else {
+        fn(std::forward<V>(v));
+      }
+    } else {
+      assert(!is_resolved());
+      if constexpr (std::is_lvalue_reference_v<V>) {
+        resolved_value.template emplace<T>(T(v));
+      } else {
+        resolved_value.template emplace<T>(std::forward<V>(v));
+      }
+      mutex.unlock();
+    }
+  }
+
+  bool is_resolved() const { return resolved_value.has_value(); }
+
+  std::mutex mutex;
+  typename continuation<T>::type fn;
+  typename resolved_value<T>::type resolved_value;
+};
+
+}  // namespace promise_internal
+
+inline Promise<void> MakePromise(Arena* arena = nullptr);
+template <typename T>
+inline Promise<std::remove_cvref_t<T>> MakePromise(T&& t);
+template <typename T>
+inline Promise<std::remove_cvref_t<T>> MakePromise(Arena*, T&& t);
+
+///////////////////////////////////////////////////////////////////////////////
+//
+// Promise: building block used to construct a continuation chain of functions
+//          with support for asynchronous callbacks.
+//
+template <typename T>
+class Promise {
+  template <typename U>
+  static const bool is_promise_v = promise_internal::is_promise_v<U>;
+  template <typename F>
+  static const bool is_invocable_v = promise_internal::is_invocable_v<F, T>;
+  static_assert(!std::is_reference_v<T>, "Promised values cannot be references.");
+  static_assert(!is_promise_v<T>, "Promised values cannot be promises.");
+
+ public:
+  using type = T;
+
+  Promise(Arena* arena = nullptr) : arena_(arena) {
+    if (arena) {
+      arena_state_ = arena->New<promise_internal::PromiseState<T>>();
+    } else {
+      shared_state_.reset(new promise_internal::PromiseState<T>);
+      arena_state_ = nullptr;
+    }
+  }
+
+  // Special case: provide a way to initialize with a resolved void promise,
+  // as zero-argument construction can't do that for us.
+  // For the non-void cases, use the below universal constructors.
+  template <typename U = T, typename = std::enable_if_t<std::is_void_v<U>>>
+  static Promise<void> MakeResolved(Arena* arena = nullptr) {
+    Promise<void> promise(arena);
+    promise.state()->init_as_resolved();
+    return promise;
+  }
+
+  // Universal constructors for non-promise values are defined to be resolved.
+  template <typename V, typename = std::enable_if_t<!std::is_void_v<V>>>
+  Promise(V&& v) : Promise() {
+    state()->init_as_resolved(std::forward<V>(v));
+  }
+
+  // Universal constructors for non-promise values are defined to be resolved.
+  template <typename V, typename = std::enable_if_t<!std::is_void_v<V>>>
+  Promise(Arena* arena, V&& v) : Promise(arena) {
+    state()->init_as_resolved(std::forward<V>(v));
+  }
+
+  // Universal constructors are deleted for all other promise specializations.
+  template <typename U>
+  requires (is_promise_v<U>)
+  Promise(Promise<U>&&) = delete;
+
+  // Universal constructors are deleted for all other promise specializations.
+  template <typename U>
+  requires (is_promise_v<U>)
+  Promise(Arena*, Promise<U>&&) = delete;
+
+  //////////////////////////////////////////////////////////////////////////////
+  // resolve() and resolve(V)
+  // Insinuate a callback to a chained then() with the provided value, if any.
+  // Specifically: if there is a continuation, propagate the value now;
+  // otherwise, store the value in the promise state for later chaining.
+  //
+  template <typename U = T, typename = std::enable_if_t<std::is_void_v<U>>>
+  void resolve() { state()->resolve(); }
+  template <typename V>
+  void resolve(V&& v) { state()->resolve(std::forward<V>(v)); }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // deferred()
+  //
+  // Obtain a callback that can be used to resolve later.
+  //
+  typename promise_internal::continuation<T>::type deferred() {
+    typename promise_internal::continuation<T>::type fn;
+    if constexpr (std::is_void_v<T>) {
+      if (arena_state_) {
+        fn = [s{arena_state_}] { return s->resolve(); };
+      } else {
+        fn = [s{shared_state_}] { return s->resolve(); };
+      }
+    } else {
+      // Ideally, we would say T&&/std::forward but Idina callbacks would have
+      // to change to use std::forward<T>. Breaking/requiring is not worth it.
+      if (arena_state_) {
+        fn = [s{arena_state_}](T t) { return s->resolve(std::move(t)); };
+      } else {
+        fn = [s{shared_state_}](T t) { return s->resolve(std::move(t)); };
+      }
+    }
+    return fn;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // operator bool()
+  //
+  // Returns true if there is a pending continuation attached, convenient when
+  // creating chains iteratively.
+  //
+  explicit operator bool() const { return state()->fn != nullptr; }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // then(F: T -> X)
+  //
+  // Specify a continuation function to be called with this promise is resolved.
+  // X can be void, non-void, Promise<void>, or Promise<V> for non-void V
+  //
+  template <typename F>
+  requires (!is_invocable_v<F>)
+  auto then(F&& fn) {
+    // If the following assertion fires, a continuation passed into a then()
+    // handler takes an argument that cannot be obtained by converting the
+    // subject promise type T.
+    // For example: Promise<int> f; f.then([](std::string) {}); is an error
+    // The clang compiler provides a helpful note that we encourage devs to see
+    // by disabling clang-format from wrapping the static_assert message.
+    // clang-format off
+    static_assert(is_invocable_v<F>, "The conflicting T type and then() function are both given in the following note:");
+    // clang-format on
+  }
+  template <typename F>
+  requires (is_invocable_v<F>)
+  auto then(F&& fn){
+    // There are a total of 16 cases (four of which are folded into two blocks):
+    // T: resolved void | resolved non-void | pending void | pending non-void
+    // F: T -> void | non-void | Promise<void> | Promise<non-void>
+    auto* s = state();
+    if (!s->is_resolved()) s->mutex.lock();
+    if constexpr (std::is_void_v<T>) {
+      if constexpr (is_promise_v<std::invoke_result_t<F>>) {
+        if (s->is_resolved()) {
+          // 1/2) T:      resolved void
+          //      F:      void -> Promise<V> for void or non-void V
+          //      action: eval fn(void) now
+          //      return: pending Promise<V>
+          return fn();
+        } else {
+          using U = std::invoke_result_t<F>;
+          using V = typename U::type;
+          Promise<V> promise(arena_);
+          // Note: s->fn lambda captures are mutable because fn can be a
+          //       mutable lambda capture.
+          if (arena_) {
+            s->fn = [s=promise.arena_state_, fn=std::move(fn)]() mutable {
+              if constexpr (std::is_void_v<V>) {
+                // 3) T:      pending void
+                //    F:      void -> Promise<void>
+                //    action: eval fn() when T is resolved and with its result,
+                //            chain T's resolution
+                //    return: pending Promise<void> (an unwrapping action)
+                fn().then([s] { s->resolve(); });
+              } else {
+                // 4) T:      pending void
+                //    F:      void -> Promise<V> for non-void V
+                //    action: eval fn() when T is resolved and with its result,
+                //            chain T's resolution
+                //    return: pending Promise<V> (an unwrapping action)
+                fn().then([s](V&& v) { s->resolve(std::forward<V>(v)); });
+              }
+            };
+          } else {
+            s->fn = [s=promise.shared_state_, fn=std::move(fn)]() mutable {
+              if constexpr (std::is_void_v<V>) {
+                fn().then([s] { s->resolve(); });
+              } else {
+                fn().then([s](V&& v) { s->resolve(std::forward<V>(v)); });
+              }
+            };
+          }
+          s->mutex.unlock();
+          return promise;
+        }
+      } else {
+        using U = std::invoke_result_t<F>;
+        if (s->is_resolved()) {
+          if constexpr (std::is_void_v<U>) {
+              // 5) T:      resolved void
+              //    F:      void -> void
+              //    action: eval fn() now
+              //    return: resolved Promise<void>
+            fn();
+            return MakePromise(arena_);
+          } else {
+              // 6) T:      resolved void
+              //    F:      void -> V for non-void V
+              //    action: eval v = fn() now
+              //    return: resolved Promise<V>(v)
+            return MakePromise(arena_, fn());
+          }
+        } else {
+          Promise<U> promise(arena_);
+          if (arena_) {
+            s->fn = [s=promise.arena_state_, fn=std::move(fn)]() mutable {
+              if constexpr (std::is_void_v<U>) {
+                // 7) T:      pending void
+                //    F:      void -> void
+                //    action: eval fn() when T is resolved
+                //    return: pending Promise<void> automatically resolved to void
+                fn();
+                s->resolve();
+              } else {
+                // 8) T:      pending void
+                //    F:      void -> V for non-void V
+                //    action: eval v = fn() when T is resolved
+                //    return: pending Promise<V> automatically resolved to v
+                s->resolve(fn());
+              }
+            };
+          } else {
+            s->fn = [s=promise.shared_state_, fn=std::move(fn)]() mutable {
+              if constexpr (std::is_void_v<U>) {
+                fn();
+                s->resolve();
+              } else {
+                s->resolve(fn());
+              }
+            };
+          }
+          s->mutex.unlock();
+          return promise;
+        }
+      }
+    } else {
+      if constexpr (is_promise_v<std::invoke_result_t<F, T&&>>) {
+        using U = std::invoke_result_t<F, T&&>;
+        if (s->is_resolved()) {
+          // 9/10) T:      resolved T
+          //       F:      T -> Promise<V> for void or non-void V
+          //       action: eval fn(T)
+          //       return: pending Promise<V>
+          return fn(std::move(*s->resolved_value));
+        } else {
+          using V = typename U::type;
+          Promise<V> promise(arena_);
+          if (arena_) {
+            s->fn = [s=promise.arena_state_, fn=std::move(fn)](T&& t) mutable {
+              if constexpr (std::is_void_v<V>) {
+                // 11) T:      pending T
+                //     F:      T -> Promise<void>
+                //     action: eval fn() when T is resolved and with its result,
+                //             chain T's resolution
+                //     return: pending Promise<void> (an unwrapping action)
+                fn(std::forward<T>(t)).then([s] { s->resolve(); });
+              } else {
+                // 12) T:      pending T
+                //     F:      T -> Promise<V> for non-void V
+                //     action: eval fn() when T is resolved and with its result,
+                //             chain T's resolution
+                //     return: pending Promise<V> (an unwrapping action)
+                fn(std::forward<T>(t)).then([s](V&& v) mutable {
+                  s->resolve(std::forward<V>(v));
+                });
+              }
+            };
+          } else {
+            s->fn = [s=promise.shared_state_, fn=std::move(fn)](T&& t) mutable {
+              if constexpr (std::is_void_v<V>) {
+                fn(std::forward<T>(t)).then([s] { s->resolve(); });
+              } else {
+                fn(std::forward<T>(t)).then([s](V&& v) mutable {
+                  s->resolve(std::forward<V>(v));
+                });
+              }
+            };
+          }
+          s->mutex.unlock();
+          return promise;
+        }
+      } else {
+        using U = std::invoke_result_t<F, T&&>;
+        if (s->is_resolved()) {
+          if constexpr (std::is_void_v<U>) {
+            // 13) T:      resolved T
+            //     F:      T -> void
+            //     action: eval fn(T) now
+            //     return: resolved Promise<void>
+            fn(*std::move(s->resolved_value));
+            return MakePromise(arena_);
+          } else {
+            // 14) T:      resolved T
+            //     F:      T -> V for non-void V
+            //     action: eval fn(T) now
+            //     return: resolved Promise<V>
+            return MakePromise(arena_, fn(*std::move(s->resolved_value)));
+          }
+        } else {
+          Promise<U> promise(arena_);
+          if (arena_) {
+            s->fn = [s=promise.arena_state_, fn=std::move(fn)](T&& t) mutable {
+              if constexpr (std::is_void_v<U>) {
+                // 15) T:      pending T
+                //     F:      T -> void
+                //     action: eval fn(T) when T is resolved
+                //     return: pending Promise<void> automatically resolved to v
+                fn(std::forward<T>(t));
+                s->resolve();
+              } else {
+                // 16) T:      pending T
+                //     F:      T -> V for some non-void V
+                //     action: eval v = fn(T) when T is resolved
+                //     return: pending Promise<V> automatically resolved to v
+                s->resolve(fn(std::forward<T>(t)));
+              }
+            };
+          } else {
+            s->fn = [s=promise.shared_state_, fn=std::move(fn)](T&& t) mutable {
+              if constexpr (std::is_void_v<U>) {
+                fn(std::forward<T>(t));
+                s->resolve();
+              } else {
+                s->resolve(fn(std::forward<T>(t)));
+              }
+            };
+          }
+          s->mutex.unlock();
+          return promise;
+        }
+      }
+    }
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // get()
+  //
+  // Obtain the resolved value of this promise, blocking as needed.
+  //
+  auto get() {
+    auto* s = state();
+    if (s->is_resolved()) {
+      if constexpr (!std::is_void_v<T>) {
+        return *std::move(s->resolved_value);
+      }
+    } else {
+      Semaphore sem;
+      if constexpr (std::is_void_v<T>) {
+        then([&sem]() mutable { sem.post(); });
+        sem.wait();
+      } else {
+        T result;
+        then([&sem, &result](T&& t) mutable {
+          result = std::move(t);
+          sem.post();
+        });
+        sem.wait();
+        return std::move(result);
+      }
+    }
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // wait()
+  //
+  // Use get() to get the resolved promise (blocking as needed), and create
+  // a resolved promise to result. Often used at a tail of a Promise<void>
+  // continuation chain as get() on a Promise<void> is somewhat non-idiomatic.
+  //
+  auto wait() {
+    if constexpr (std::is_void_v<T>) {
+      get();
+      return MakePromise();
+    } else {
+      return MakePromise(get());
+    }
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // then_via()
+  //
+  // A form of then() that delegates to via, a function expected to schedule the
+  // invocation of the given continuation function fn.
+  //
+  template <typename Via, typename F>
+  requires (is_invocable_v<F>)
+  auto then_via(Via&& via, F&& fn) {
+    if constexpr (std::is_void_v<T>) {
+      using U = std::invoke_result_t<F>;
+      Promise<typename promise_internal::unwrap_promise<U>::type> promise;
+      then([via{std::move(via)}, fn{std::move(fn)}, cb{promise.deferred()}] {
+        via([fn{std::move(fn)}, cb{std::move(cb)}] {
+          MakePromise().then(std::move(fn)).then(std::move(cb));
+        });
+      });
+      return promise;
+    } else {
+      using U = std::invoke_result_t<F, T&&>;
+      Promise<typename promise_internal::unwrap_promise<U>::type> promise;
+      then([via{std::move(via)}, fn{std::move(fn)}, cb{promise.deferred()}]
+          (T&& t) {
+        via([fn{std::move(fn)}, cb{std::move(cb)}, t{std::forward<T>(t)}]
+            () mutable {
+          MakePromise(std::forward<T>(t)).then(std::move(fn)).
+              then(std::move(cb));
+        });
+      });
+      return promise;
+    }
+  }
+
+ private:
+  template <class U>
+  friend class Promise;
+
+  promise_internal::PromiseState<T>* state() const {
+    return arena_state_ ? arena_state_ : shared_state_.get();
+  }
+  Arena* arena_;
+  promise_internal::PromiseState<T>* arena_state_;
+  std::shared_ptr<promise_internal::PromiseState<T>> shared_state_;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// MakePromise
+//
+// This is a collection of overloads addressing several interop scenarios.
+// 1. To wrap a void or non-void values with a synchronously resolved promise.
+//    This is typically used in then() bodies that returns promises
+//    in some of its conditional branches. (Note: then() will unwrap
+//    nested promises: i.e. if the body of then() returns Promise<Promise<T>>,
+//    then() itself return a Promise<T>.)
+// 2. To wrap an asynchronous callback with Promise<void>, where callback is
+//    found as the last argument in a a.) Reset method, b.) constructor, or
+//    c.) function.
+//
+inline Promise<void> MakePromise(Arena* arena) {
+  // void -> Promise<void>
+  // Special case: a default constructor normally gives us an unresolved
+  // promise. We'd rather have a resolved promise that also shortcuts locking
+  // (knowing that promise initializations can't race continuation chaining).
+  return Promise<void>::MakeResolved(arena);
+}
+
+// With the exception of std::shared_ptr MakePromise encourages moves.
+template <typename T>
+inline Promise<std::remove_cvref_t<T>> MakePromise(T&& t) {
+  // non-void T -> Promise<T>
+  using U = std::remove_reference_t<T>;
+  return Promise<U>(std::forward<U>(t));
+}
+
+// With the exception of std::shared_ptr MakePromise encourages moves.
+template <typename T>
+inline Promise<std::remove_cvref_t<T>> MakePromise(Arena* arena, T&& t) {
+  // non-void T -> Promise<T>
+  using U = std::remove_reference_t<T>;
+  return Promise<U>(arena, std::forward<U>(t));
+}
+
+template <typename T>
+inline Promise<std::shared_ptr<T>> MakePromise(std::shared_ptr<T> p) {
+  // std::shared_ptr<T> -> Promise<std::shared_ptr<T>>
+  return Promise<std::shared_ptr<T>>(std::move(p)); // this move is okay
+}
+
+template <typename T>
+inline Promise<std::shared_ptr<T>> MakePromise(Arena* arena, std::shared_ptr<T> p) {
+  // std::shared_ptr<T> -> Promise<std::shared_ptr<T>>
+  return Promise<std::shared_ptr<T>>(arena, std::move(p)); // this move is okay
+}
+
+// MakeViaPromise: wrapper that invokes then_via() from a resolved promise.
+template <typename Via, typename F>
+auto MakeViaPromise(Via&& via, F&& fn) {
+  return MakePromise().then_via(std::move(via), std::move(fn));
+}
+template <typename Via, typename F>
+auto MakeViaPromise(Arena* arena, Via&& via, F&& fn) {
+  return MakePromise(arena).then_via(std::move(via), std::move(fn));
+}
+
+namespace promise_internal {
+// Test for whether the first argument of a parameter pack is Arena*.
+template <typename Arg0 = void, typename... Args>
+struct has_Arena {
+  static constexpr bool value = std::is_same_v<Arena*, Arg0>;
+};
+
+// Test for whether class C has a method named Reset.
+template<typename C, typename... Args>
+struct has_Reset {
+  template<typename C_>
+  static constexpr auto check(C_*) ->
+      decltype(std::declval<C_>().Reset(std::declval<Args>()...,
+      std::declval<std::function<void()>>), std::true_type());
+  template<typename>
+  static constexpr std::false_type check(...);
+  static constexpr bool value = decltype(check<C>(nullptr))::value;
+};
+}  // namespace promise_internal
+
+template <typename T, typename... Args,
+    typename = std::enable_if_t<std::is_class_v<T>>>
+auto MakePromise(Args&&... args) {
+  Promise<void> promise;
+  T* pt;
+  if constexpr (promise_internal::has_Arena<Args...>::value) {
+    Arena* arena = std::get<0>(std::forward_as_tuple(
+        std::forward<Args>(args)...));
+    if constexpr (promise_internal::has_Reset<T, Args...>::value) {
+      // Class::Reset(arena, args..., cb) -> Promise<std::shared_ptr<Class>>
+      pt = arena->template New<T>();
+      pt->Reset(std::forward<Args>(args)..., promise.deferred());
+    } else {
+      // Class::Class(arena, args..., cb) -> Promise<std::shared_ptr<Class>>
+      pt = arena->template New<T>(std::forward<Args>(args)...,
+          promise.deferred());
+    }
+    return promise.then([pt] {
+      // Provide a custom deleter that invokes the destructor.
+      return std::shared_ptr<T>(pt, [](T* t) { t->~T(); });
+    });
+  } else {
+    if constexpr (promise_internal::has_Reset<T, Args...>::value) {
+      // Class::Class(args..., cb) -> Promise<std::shared_ptr<Class>>
+      pt = new T();
+      pt->Reset(std::forward<Args>(args)..., promise.deferred());
+    } else {
+      // Class::Reset(args..., cb) -> Promise<std::shared_ptr<Class>>
+      pt = new T(std::forward<Args>(args)..., promise.deferred());
+    }
+    return promise.then([pt] { return std::shared_ptr<T>(pt); });
+  }
+}
+
+template <typename F, typename... Args,
+    typename = std::enable_if_t<std::is_function_v<F(Args&&...)>>>
+Promise<void> MakePromise(F&& fn, Args&&... args) {
+  Promise<void> promise;
+  fn(std::forward<Args>(args)..., promise.deferred());
+  return promise;
+}
+
+template <typename T, typename F, typename... Args,
+    typename = std::enable_if_t<std::is_function_v<F(Args&&...)>>>
+Promise<T> MakeTypedPromise(F&& fn, Args&&... args) {
+  Promise<T> promise;
+  fn(std::forward<Args>(args)..., promise.deferred());
+  return promise;
+}
+
+template <typename F, typename... Args,
+    typename = std::enable_if_t<std::is_function_v<F(Args&&...)>>>
+Promise<void> MakePromise(Arena* arena, F&& fn, Args&&... args) {
+  Promise<void> promise(arena);
+  fn(std::forward<Args>(args)..., promise.deferred());
+  return promise;
+}
+
+template <typename T, typename F, typename... Args,
+    typename = std::enable_if_t<std::is_function_v<F(Args&&...)>>>
+Promise<T> MakeTypedPromise(Arena* arena, F&& fn, Args&&... args) {
+  Promise<T> promise(arena);
+  fn(std::forward<Args>(args)..., promise.deferred());
+  return promise;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// PromiseForAll
+//
+// Applies iterated iterated elements to given function that maps each to a
+// promise. When all of these are resolved, the returned Promise<std:vector<T>>
+// is resolved.  If T is void, we return Promise<void>.
+//
+// Optional behavior is specified with PromiseForAllOptions.
+struct PromiseForAllOptions {
+  // If batch_size is specified, mapped promises are invoked in batches, where
+  // all the promises in a batch must be resolved before the next batch begins.
+  // By default, all promises are invoked in a single batch.  This is
+  // particularly used instead of max_parallelism in Idina scenarios that cannot
+  // block with wait(), but both options can still be used in tandem.
+  size_t batch_size = std::numeric_limits<size_t>::max();
+
+  // If max_parallelism is non-zero, a semaphore wait is use to limit the
+  // number of concurrent promises that can be executed.
+  size_t max_parallelism = 0;
+
+  // If stride > 1, the promise map function is called with a range of values
+  // of up to size stride. By default, the promise map function is called with
+  // a single value. This parameter is intended for grouping multiple values
+  // into one asynchronous operation.
+  size_t stride = 1;
+
+  // Optional arena for allocation of promises
+  Arena* arena = nullptr;
+};
+
+namespace promise_internal {
+
+template <typename T>
+struct ForAllState {
+  ForAllState(const PromiseForAllOptions& options_in, size_t count_in) :
+      options(options_in), in_flight(options.max_parallelism),
+      count_in(count_in) {
+  }
+  PromiseForAllOptions options;
+  Semaphore in_flight;
+  std::atomic<size_t> count_in;
+  std::mutex mutex;
+  std::vector<T> values;
+  std::function<void(std::vector<T>)> done;
+};
+
+template <>
+struct ForAllState<void> {
+  ForAllState(const PromiseForAllOptions& options_in, size_t count_in) :
+      options(options_in), in_flight(options.max_parallelism),
+      count_in(count_in) {
+  }
+  PromiseForAllOptions options;
+  Semaphore in_flight;
+  std::atomic<size_t> count_in;
+  std::function<void()> done;
+};
+
+template<typename Vs, typename F, typename = void>
+struct has_iter_args : std::false_type {};
+template <typename Vs, typename F>
+struct has_iter_args<Vs, F, std::enable_if_t<std::is_invocable_v<F,
+    typename Vs::const_iterator, typename Vs::const_iterator>>> :
+    std::true_type {};
+template<typename Vs, typename F, typename I = typename Vs::const_iterator>
+requires (!has_iter_args<Vs, F>::value)
+auto call_map(const F& map, I begin, I end) {
+  return map(*begin);
+}
+template<typename Vs, typename F, typename I = typename Vs::const_iterator>
+requires (has_iter_args<Vs, F>::value)
+auto call_map(const F& map, I begin, I end) {
+  return map(begin, end);
+}
+
+}  // namespace promise_internal
+
+// PromiseForAll overload that works with iterators across a collection of
+// values, each of which is mapped to a promise using the given map function.
+// Max paralellism/stride options are handled here. Use overload that takes a
+// vector for handling batching (non-blocking, unlike max_parallelism).
+template <typename Vs, typename F, typename I = typename Vs::const_iterator>
+inline auto PromiseForAll(I begin, I end, const F& map,
+    PromiseForAllOptions options = {}) {
+  using P = decltype(promise_internal::call_map<Vs, F>(map, begin, end));
+  static_assert(promise_internal::is_promise_v<P>, "map must return a promise");
+  using T = typename P::type;
+  Promise<std::conditional_t<std::is_void_v<T>, void, std::vector<T>>>
+      result_promise(options.arena);
+  size_t count_out = std::distance(begin, end);
+  if (!count_out) {
+    if constexpr (std::is_void_v<T>) {
+      result_promise.resolve();
+    } else {
+      result_promise.resolve(std::vector<T>{});
+    }
+    return result_promise;
+  }
+  size_t stride = std::max<size_t>(options.stride, 1);
+  size_t count_in = count_out / stride + count_out % stride;
+
+  auto* state = options.arena
+      ? options.arena->New<promise_internal::ForAllState<T>>(options, count_in)
+      : new promise_internal::ForAllState<T>(options, count_in);
+  state->done = result_promise.deferred();
+  while (count_out) {
+    size_t n = std::min(stride, count_out);
+    auto next = begin + n;
+    count_out -= n;
+    if (options.max_parallelism) state->in_flight.wait();
+    auto promise = promise_internal::call_map<Vs, F>(map, begin, next);
+    if constexpr (std::is_void_v<T>) {
+      promise.then([state] {
+        if (state->options.max_parallelism) state->in_flight.post();
+        if (--state->count_in == 0) {
+          state->done();
+          if (state->options.arena) {
+            //state->~ForAllState<void>();
+          } else {
+            delete state;
+          }
+        }
+      });
+    } else {
+      promise.then([state](T&& t) {
+        if (state->options.max_parallelism) state->in_flight.post();
+        {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          state->values.push_back(std::forward<T>(t));
+        }
+        if (--state->count_in == 0) {
+          state->done(std::move(state->values));
+          if (state->options.arena) {
+            //state->~ForAllState<T>();
+          } else {
+            delete state;
+          }
+        }
+      });
+    }
+    begin = next;
+  }
+  assert(begin == end);
+  return result_promise;
+}
+
+// PromiseForAll overload that takes a vector and optionally handles batching
+// using PromiseForAllOptions::batch_size.  Batching is offered in lieu of using
+// max_parallelism for cases we cannot block; the tradeoff is that each batch
+// of promises must be resolved before the next batch of promises are created.
+template <typename Vs, typename F>
+inline auto PromiseForAll(const Vs& values, const F& map,
+    PromiseForAllOptions options = {}) {
+  auto begin = std::begin(values), end = std::end(values);
+  using P = decltype(promise_internal::call_map<Vs, F>(map, begin, end));
+  static_assert(promise_internal::is_promise_v<P>, "map must return a promise");
+  using T = typename P::type;
+  if (begin == end) return PromiseForAll<Vs, F>(begin, end, map, options);
+  if constexpr (std::is_void_v<T>) {
+    Promise<void> start_promise(options.arena), promise(options.arena);
+    for (size_t c = std::distance(begin, end), n; c; c -= n, begin += n) {
+      n = std::min(c, options.batch_size);
+      promise = (start_promise ? promise : start_promise).then(
+          [begin, end{begin + n}, map, options] {
+        return PromiseForAll<Vs, F>(begin, end, map, options);
+      });
+    }
+    start_promise.resolve();
+    return promise;
+  } else {
+    Promise<std::vector<T>> start_promise(options.arena), promise(options.arena);
+    for (size_t c = std::distance(begin, end), n; c; c -= n, begin += n) {
+      n = std::min(c, options.batch_size);
+      promise = (start_promise ? promise : start_promise).then(
+          [begin, end{begin + n}, map, options](std::vector<T>&& accum) {
+        return PromiseForAll<Vs, F>(begin, end, map, options).then(
+            [accum{std::move(accum)}](std::vector<T>&& out_values) mutable {
+          for (auto&& value : out_values) accum.push_back(std::move(value));
+          return std::move(accum);
+        });
+      });
+    }
+    start_promise.resolve(std::vector<T>{});
+    return promise;
+  }
+}
+
+// PromiseForAll overload that is directly given a collection of promises to
+// fan-in.
+template <typename Promises>
+inline auto PromiseForAll(const Promises& promises,
+    PromiseForAllOptions options = {}) {
+  return PromiseForAll(promises, [](auto promise) { return promise; }, options);
+}
+
+}  // namespace ks
+
+#endif  // UTIL_PROMISE_H_
