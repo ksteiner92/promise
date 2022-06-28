@@ -37,6 +37,19 @@ class Arena {
     return new (mem) T{};
   }
 
+
+  template <typename T, typename... Args>
+  requires (!std::is_array_v<T>)
+  T* New(Args... args) {
+    return new (Allocate(sizeof(T))) T(std::forward<Args>(args)...);
+  }
+
+  template <typename T, typename Base = std::decay_t<decltype(std::declval<T>()[0])>>
+  requires std::is_array_v<T>
+  Base* New() {
+    return new (Allocate(sizeof(T))) Base[sizeof(T)/sizeof(Base)];
+  }
+
  private:
   char* AllocateFallback(size_t bytes);
   char* AllocateNewBlock(size_t block_bytes);

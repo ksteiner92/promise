@@ -16,6 +16,13 @@ struct Options {
       (CURLOPT_FOLLOWLOCATION)redirs);
 };
 
+//Promise<void> test(const HttpClient& client) {
+//  auto result = co_await client.get<Result, Options>("https://google.com",
+//      nullptr,
+//      Options{});
+//  std::cout << result->content.data() << std::endl;
+//}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -25,6 +32,7 @@ int main(int argc, char** argv) {
                                            Options{})
                     .get();
 
+  //test(client).wait();
   std::cout << result->content.data() << std::endl;
 
   return 0;

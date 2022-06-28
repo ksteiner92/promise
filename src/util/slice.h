@@ -1,6 +1,7 @@
 #ifndef UTILS_SLICE_H_
 #define UTILS_SLICE_H_
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstring>
